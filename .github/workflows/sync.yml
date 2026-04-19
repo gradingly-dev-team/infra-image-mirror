@@ -1,0 +1,114 @@
+name: sync-infra-mirror
+
+# Runs every Sunday at 03:00 UTC — two hours before the AKS maintenance window
+# (Sundays 05:00 UTC) so fresh images are available before any node rotation.
+# Also triggerable manually via workflow_dispatch.
+
+on:
+  schedule:
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+
+permissions:
+  packages: write
+  contents: read
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Pure mirrors — skopeo copy, preserve multi-arch manifests.
+  # ---------------------------------------------------------------------------
+  sync-copy:
+    name: sync ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: redis
+            src: docker.io/bitnami/redis:8.6.1
+            dst_tag: redis:8.6.1
+          - name: redis-exporter
+            src: docker.io/bitnami/redis-exporter:1.80.1
+            dst_tag: redis-exporter:1.80.1
+          - name: postgres-exporter
+            src: docker.io/bitnami/postgres-exporter:0.18.1
+            dst_tag: postgres-exporter:0.18.1
+    steps:
+      - name: Install skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+
+      - name: Login to ghcr.io
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            skopeo login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Copy ${{ matrix.src }} -> ghcr.io
+        run: |
+          skopeo copy --all \
+            docker://${{ matrix.src }} \
+            docker://ghcr.io/${{ github.repository_owner }}/infra-image-mirror/${{ matrix.dst_tag }}
+
+      - name: Verify digest
+        run: |
+          skopeo inspect \
+            docker://ghcr.io/${{ github.repository_owner }}/infra-image-mirror/${{ matrix.dst_tag }} \
+            | jq -r '{Name, Digest, Created}'
+
+  # ---------------------------------------------------------------------------
+  # In-house build — CNPG postgres with PostGIS + pgvector + barman.
+  #
+  # STUB: the Dockerfile lives in the separate `kubernetes` repo at
+  # platform_services/postgresql/images/Dockerfile. Before enabling this job:
+  #
+  #   1. Decide how this workflow accesses that repo. Options:
+  #      (a) Make the kubernetes repo public and use `actions/checkout@v4`
+  #          with `repository: gradingly-dev-team/kubernetes`.
+  #      (b) Create a deploy key on the kubernetes repo + store private half
+  #          as a secret here; use `webfactory/ssh-agent@v0.9.0`.
+  #      (c) Use a fine-grained PAT with read access to the kubernetes repo.
+  #
+  #   2. Confirm whether `:18.3-postgis-vector` and
+  #      `:18.3-postgis-vector-barman` are two separate images or the same
+  #      Dockerfile at different git refs. See harbor-bootstrap-resilience.md
+  #      Phase 1.2.
+  #
+  #   3. Uncomment the job below and fill in the repo-access mechanism.
+  # ---------------------------------------------------------------------------
+
+  # build-cnpg:
+  #   name: build ${{ matrix.tag }}
+  #   runs-on: ubuntu-latest
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       include:
+  #         - tag: 18.3-postgis-vector-barman
+  #           git_ref: main             # current Dockerfile HEAD
+  #         - tag: 18.3-postgis-vector
+  #           git_ref: <commit-before-barman>   # resolve in Phase 1
+  #   steps:
+  #     - name: Checkout kubernetes repo
+  #       uses: actions/checkout@v4
+  #       with:
+  #         repository: gradingly-dev-team/kubernetes
+  #         ref: ${{ matrix.git_ref }}
+  #         path: kubernetes
+  #         # token: ${{ secrets.KUBERNETES_REPO_READ_PAT }}   # if private
+  #     - name: Set up Docker Buildx
+  #       uses: docker/setup-buildx-action@v3
+  #     - name: Login to ghcr.io
+  #       uses: docker/login-action@v3
+  #       with:
+  #         registry: ghcr.io
+  #         username: ${{ github.actor }}
+  #         password: ${{ secrets.GITHUB_TOKEN }}
+  #     - name: Build and push
+  #       uses: docker/build-push-action@v5
+  #       with:
+  #         context: kubernetes/platform_services/postgresql/images
+  #         platforms: linux/amd64
+  #         push: true
+  #         tags: ghcr.io/${{ github.repository_owner }}/infra-image-mirror/cnpg-postgresql:${{ matrix.tag }}
