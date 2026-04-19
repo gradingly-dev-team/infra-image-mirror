@@ -1,12 +1,11 @@
 name: sync-infra-mirror
 
-# Runs every Sunday at 03:00 UTC — two hours before the AKS maintenance window
-# (Sundays 05:00 UTC) so fresh images are available before any node rotation.
-# Also triggerable manually via workflow_dispatch.
+# Triggered only on-demand. Bootstrap-critical images should change
+# only when a human intentionally bumps a version tag in the matrix
+# below — not silently by a scheduled refresh. Bump a tag → run the
+# workflow manually → new bits land in ghcr.io.
 
 on:
-  schedule:
-    - cron: '0 3 * * 0'
   workflow_dispatch:
 
 permissions:
@@ -17,6 +16,23 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Pure mirrors — skopeo copy, preserve multi-arch manifests.
+  #
+  # Source is the in-house Harbor instance, NOT Docker Hub, for historical
+  # reasons. The Redis / redis-exporter / postgres-exporter images were
+  # originally mirrored from `docker.io/bitnami/*`, but Bitnami deprecated
+  # their free Docker Hub distribution in 2025. The only remaining copies
+  # of these specific tags are in our Harbor. This workflow pulls from
+  # Harbor and publishes to ghcr.io, which (unlike Harbor) can be reached
+  # without Harbor itself being healthy — the whole point of this mirror.
+  #
+  # Long-term, harbor-redis should migrate off Bitnami (to Valkey or the
+  # official Redis image). That's a separate migration ticket, not in
+  # scope for the resilience fix. Until then, this workflow keeps the
+  # existing Bitnami-origin bits accessible via a non-circular path.
+  #
+  # Auth required: `HARBOR_PULL_USERNAME` + `HARBOR_PULL_PASSWORD` repo
+  # secrets, typically a dedicated pull-only robot on the `library`
+  # project. See Harbor AGENT.md for how to create a pull robot.
   # ---------------------------------------------------------------------------
   sync-copy:
     name: sync ${{ matrix.name }}
@@ -26,13 +42,13 @@ jobs:
       matrix:
         include:
           - name: redis
-            src: docker.io/bitnami/redis:8.6.1
+            src: registry.gradingly.com/library/redis:8.6.1
             dst_tag: redis:8.6.1
           - name: redis-exporter
-            src: docker.io/bitnami/redis-exporter:1.80.1
+            src: registry.gradingly.com/library/redis-exporter:1.80.1
             dst_tag: redis-exporter:1.80.1
           - name: postgres-exporter
-            src: docker.io/bitnami/postgres-exporter:0.18.1
+            src: registry.gradingly.com/library/postgres-exporter:0.18.1
             dst_tag: postgres-exporter:0.18.1
     steps:
       - name: Install skopeo
@@ -40,7 +56,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y skopeo
 
-      - name: Login to ghcr.io
+      - name: Login to source registry (Harbor)
+        run: |
+          echo "${{ secrets.HARBOR_PULL_PASSWORD }}" | \
+            skopeo login registry.gradingly.com \
+              -u "${{ secrets.HARBOR_PULL_USERNAME }}" \
+              --password-stdin
+
+      - name: Login to destination registry (ghcr.io)
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | \
             skopeo login ghcr.io -u ${{ github.actor }} --password-stdin
@@ -60,12 +83,12 @@ jobs:
   # ---------------------------------------------------------------------------
   # In-house build — CNPG postgres with PostGIS + pgvector + barman.
   #
-  # STUB: the Dockerfile lives in the separate `kubernetes` repo at
+  # STUB: the Dockerfile lives in the separate kubernetes repo at
   # platform_services/postgresql/images/Dockerfile. Before enabling this job:
   #
   #   1. Decide how this workflow accesses that repo. Options:
   #      (a) Make the kubernetes repo public and use `actions/checkout@v4`
-  #          with `repository: gradingly-dev-team/kubernetes`.
+  #          with `repository: <owner>/kubernetes-infra`.
   #      (b) Create a deploy key on the kubernetes repo + store private half
   #          as a secret here; use `webfactory/ssh-agent@v0.9.0`.
   #      (c) Use a fine-grained PAT with read access to the kubernetes repo.
@@ -93,7 +116,7 @@ jobs:
   #     - name: Checkout kubernetes repo
   #       uses: actions/checkout@v4
   #       with:
-  #         repository: gradingly-dev-team/kubernetes
+  #         repository: <owner>/kubernetes-infra
   #         ref: ${{ matrix.git_ref }}
   #         path: kubernetes
   #         # token: ${{ secrets.KUBERNETES_REPO_READ_PAT }}   # if private
